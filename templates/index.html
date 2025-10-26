@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Social Media Downloader</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .spinner { border:3px solid #f3f3f3; border-top:3px solid #2563eb; border-radius:50%; width:16px; height:16px; animation:spin .8s linear infinite; display:inline-block; vertical-align:middle; margin-right:6px;}
+    @keyframes spin {0%{transform:rotate(0)}100%{transform:rotate(360deg)}}
+    .log { max-height: 180px; overflow:auto; background:#0f172a; color:#e6eef8; padding:8px; border-radius:6px; font-family: monospace; font-size:12px;}
+    .hint-banner { background: linear-gradient(90deg,#fff7ed,#ffedd5); border-left:4px solid #f59e0b; padding:10px; border-radius:8px; color:#92400e; margin-bottom:10px;}
+  </style>
+</head>
+<body class="bg-gray-100 min-h-screen flex items-center justify-center p-6">
+  <div class="w-full max-w-2xl bg-white rounded-xl shadow p-6">
+    <h1 class="text-2xl font-semibold mb-3">🎬 Social Media Downloader</h1>
+
+    <input id="urlInput" class="w-full border rounded p-2 mb-3" placeholder="Paste video URL (YouTube, Instagram, Facebook...)" />
+
+    <div class="flex gap-2 mb-3">
+      <button id="getInfoBtn" class="flex-1 bg-blue-600 text-white py-2 rounded">Get Info</button>
+      <button id="autoCookieBtn" class="px-3 bg-gray-200 rounded">Auto Cookies</button>
+    </div>
+
+    <div class="mb-3">
+      <label class="block text-sm font-medium">Cookies (optional)</label>
+      <input id="cookiesFile" type="file" accept=".txt" class="mt-1" />
+      <label class="inline-flex items-center ml-1 mt-2">
+        <input id="useBrowserCookies" type="checkbox" class="mr-2" /> Try local browser cookies
+      </label>
+    </div>
+
+    <div id="hintArea" class="hidden hint-banner">
+      <div id="hintText">Background task running — merging audio & video. This may take time. Please wait.</div>
+    </div>
+
+    <div id="infoSection" class="hidden border rounded p-3 bg-gray-50 mb-3">
+      <img id="thumb" class="w-full rounded mb-2 object-contain max-h-48" />
+      <h2 id="videoTitle" class="font-semibold text-lg"></h2>
+      <div id="metaRow" class="text-sm text-gray-600 mb-3"></div>
+
+      <label class="block text-sm font-medium">Video formats (containers)</label>
+      <select id="formatSelect" class="w-full border rounded p-2 mb-3"></select>
+
+      <label class="block text-sm font-medium">Audio outputs (optional)</label>
+      <select id="audioSelect" class="w-full border rounded p-2 mb-3">
+        <option value="">(No audio-only conversion)</option>
+        <option value="audio:mp3">MP3</option>
+        <option value="audio:m4a">M4A</option>
+        <option value="audio:flac">FLAC</option>
+        <option value="audio:opus">Opus</option>
+      </select>
+
+      <div class="flex gap-2">
+        <button id="downloadBtn" class="flex-1 bg-green-600 text-white py-2 rounded">Download</button>
+        <button id="clearBtn" class="bg-gray-300 px-3 rounded">Clear</button>
+      </div>
+    </div>
+
+    <div id="progressBar" class="hidden mt-3 bg-gray-200 rounded-full h-4 overflow-hidden">
+      <div id="progressInner" class="h-4 bg-blue-600 w-0"></div>
+    </div>
+
+    <div id="statusText" class="mt-2 text-sm text-gray-600"></div>
+
+    <div class="mt-4">
+      <label class="block mb-1 text-sm font-medium">Live log</label>
+      <div id="liveLog" class="log"></div>
+    </div>
+  </div>
+
+  <script src="/static/script.js"></script>
+</body>
+</html>
