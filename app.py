@@ -13,6 +13,8 @@ from flask import Flask, request, jsonify, send_file, render_template, send_from
 import yt_dlp
 import html
 import http.cookiejar as cookiejar
+import json
+import base64
 
 # Optional browser cookie support
 try:
@@ -35,12 +37,14 @@ TASK_LOCK = threading.Lock()
 def safe_basename(path: str) -> str:
     return Path(path).name
 
+
 def add_task_message(task_id, text):
     t = TASKS.get(task_id)
     if t is None:
         return
     msgs = t.setdefault("messages", [])
     msgs.append({"ts": int(time.time()), "text": text})
+
 
 def run_subprocess(cmd, env=None, timeout=None):
     try:
@@ -54,6 +58,7 @@ def run_subprocess(cmd, env=None, timeout=None):
         return 124, "", f"timeout: {e}"
     except Exception as e:
         return 1, "", str(e)
+
 
 def find_file_by_info(info):
     try:
@@ -96,6 +101,7 @@ def ffprobe_codecs(path: Path):
         return {"video": vcodec, "audio": acodec}
     except Exception:
         return None
+
 
 def is_quicktime_compatible(codecs: dict):
     if not codecs:
@@ -140,6 +146,7 @@ def choose_best_container(info):
     if "av1" in vcodec:
         return "webm"
     return "mp4"
+
 
 def remux_or_encode(task_id, src_path: Path, desired_ext: str, reencode_on_fail=True):
     try:
@@ -239,69 +246,130 @@ def remux_or_encode(task_id, src_path: Path, desired_ext: str, reencode_on_fail=
         return src_path
 
 # ---------------- Cookie helpers ----------------
-def export_browser_cookies_for_domain(domain: str, out_path: str) -> bool:
-    """
-    Export cookies from local browsers using browser_cookie3 into a Netscape-format cookies.txt file.
-    Returns True on success, False otherwise.
-    """
-    if not BROWSER_COOKIE3_AVAILABLE:
-        return False
-    try:
-        cj = cookiejar.MozillaCookieJar()
-        # browser_cookie3 provides cookiejar objects per-browser; try common ones
-        # Use a single combined cookiejar by iterating cookies from browser_cookie3
-        cjs = []
-        try:
-            cjs.append(browser_cookie3.chrome(domain_name=domain))
-        except Exception:
-            pass
-        try:
-            cjs.append(browser_cookie3.firefox(domain_name=domain))
-        except Exception:
-            pass
-        try:
-            cjs.append(browser_cookie3.edge(domain_name=domain))
-        except Exception:
-            pass
-        # fallback: all available
-        if not cjs:
-            try:
-                cjs.append(browser_cookie3.load())
-            except Exception:
-                pass
 
-        for jar in cjs:
-            for c in jar:
-                # create MozillaCookieJar cookie
-                m = cookiejar.Cookie(
-                    version=0, name=c.name, value=c.value,
-                    port=None, port_specified=False,
-                    domain=c.domain, domain_specified=bool(c.domain),
-                    domain_initial_dot=c.domain.startswith(".") if c.domain else False,
-                    path=c.path or "/", path_specified=True,
-                    secure=c.secure, expires=c.expires,
-                    discard=False, comment=None, comment_url=None,
-                    rest={}, rfc2109=False
-                )
-                cj.set_cookie(m)
-        cj.save(out_path, ignore_discard=True, ignore_expires=True)
+def is_netscape_format(path: str) -> bool:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            head = "".join([next(fh) for _ in range(5)])
+            if "# Netscape" in head or "\t" in head:
+                return True
+    except StopIteration:
+        pass
+    except Exception:
+        pass
+    return False
+
+
+def json_to_netscape(json_path: str, out_path: str) -> bool:
+    """
+    Convert cookie JSON (common exporter formats) to Netscape cookies.txt lines.
+    Returns True on success.
+    """
+    try:
+        with open(json_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return False
+
+    lst = None
+    if isinstance(data, list):
+        lst = data
+    elif isinstance(data, dict) and "cookies" in data and isinstance(data["cookies"], list):
+        lst = data["cookies"]
+    else:
+        # try to find list value
+        for v in data.values():
+            if isinstance(v, list):
+                lst = v
+                break
+    if not lst:
+        return False
+
+    lines = ["# Netscape HTTP Cookie File"]
+    for c in lst:
+        try:
+            domain = c.get("domain") or c.get("host") or ""
+            path = c.get("path", "/")
+            secure = "TRUE" if str(c.get("secure", False)).lower() in ("true", "1") else "FALSE"
+            exp = c.get("expirationDate") or c.get("expires") or c.get("expiry") or c.get("expire")
+            if exp is None:
+                exp_val = "0"
+            else:
+                try:
+                    exp_val = str(int(float(exp)))
+                except Exception:
+                    exp_val = "0"
+            name = c.get("name", "")
+            value = c.get("value", "")
+            flag = "TRUE" if domain.startswith(".") else "FALSE"
+            lines.append(f"{domain}\t{flag}\t{path}\t{secure}\t{exp_val}\t{name}\t{value}")
+        except Exception:
+            continue
+    try:
+        with open(out_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
         return True
     except Exception:
-        app.logger.exception("export_browser_cookies_for_domain failed")
         return False
+
 
 def make_cookiefile_from_env() -> str | None:
     """
-    Create a temp cookies.txt file from env var YTDLP_COOKIES (raw content) or return
-    YTDLP_COOKIES_FILE if that points to an existing file.
+    Create a temp cookies.txt file from env var YTDLP_COOKIES (raw content),
+    YTDLP_COOKIES_FILE, or base64 var YTDLP_COOKIES_B64.
+    Returns path to cookiefile, or None.
     Caller should unlink returned path when done.
     """
-    # 1) prefer explicit file path env
+    # 1) explicit file path env
     file_path = os.environ.get("YTDLP_COOKIES_FILE")
     if file_path:
         if os.path.exists(file_path):
-            return file_path
-    # 2) raw cookie content env var
+            # validate netscape, if not and looks like json try conversion
+            if is_netscape_format(file_path):
+                return file_path
+            else:
+                # try convert json to netscape into tmp file
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+                tmp.close()
+                ok = json_to_netscape(file_path, tmp.name)
+                if ok:
+                    return tmp.name
+                else:
+                    try:
+                        os.unlink(tmp.name)
+                    except Exception:
+                        pass
+                    return None
+
+    # 2) base64 env var - preferred for UI newline issues
+    b64 = os.environ.get("YTDLP_COOKIES_B64")
+    if b64:
+        try:
+            data = base64.b64decode(b64)
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+            tmp.close()
+            with open(tmp.name, "wb") as fh:
+                fh.write(data)
+            # validate
+            if is_netscape_format(tmp.name):
+                return tmp.name
+            # try json convert
+            conv_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+            conv_tmp.close()
+            ok = json_to_netscape(tmp.name, conv_tmp.name)
+            if ok:
+                try:
+                    os.unlink(tmp.name)
+                except Exception:
+                    pass
+                return conv_tmp.name
+            else:
+                # keep original (maybe still valid)
+                return tmp.name
+        except Exception:
+            return None
+
+    # 3) raw env var
     raw = os.environ.get("YTDLP_COOKIES")
     if raw:
         try:
@@ -309,14 +377,26 @@ def make_cookiefile_from_env() -> str | None:
             tmp.close()
             with open(tmp.name, "w", encoding="utf-8") as fh:
                 fh.write(raw)
+            if is_netscape_format(tmp.name):
+                return tmp.name
+            # try json->netscape
+            conv_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+            conv_tmp.close()
+            ok = json_to_netscape(tmp.name, conv_tmp.name)
+            if ok:
+                try:
+                    os.unlink(tmp.name)
+                except Exception:
+                    pass
+                return conv_tmp.name
             return tmp.name
         except Exception:
-            app.logger.exception("make_cookiefile_from_env failed to write tmp file")
             try:
                 os.unlink(tmp.name)
             except Exception:
                 pass
             return None
+
     return None
 
 # ---------------- yt-dlp options ----------------
@@ -348,11 +428,9 @@ def prepare_yt_dlp_opts(cookiefile=None, output_template=None, allow_unplayable=
         "geo_bypass": True,
         "http_headers": default_headers,
         "merge_output_format": merge_output_format,
-        # allow yt-dlp to pass ffmpeg copy flags if merging
         "postprocessor_args": ["-c", "copy", "-movflags", "faststart", "-threads", "2"],
     }
 
-    # Proxy support via env var YTDLP_PROXY or HTTP_PROXY/HTTPS_PROXY
     proxy = os.environ.get("YTDLP_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY")
     if proxy:
         opts["proxy"] = proxy
@@ -376,6 +454,7 @@ def prepare_yt_dlp_opts(cookiefile=None, output_template=None, allow_unplayable=
 
     return opts
 
+
 def run_ydl_extract(url, opts):
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -383,6 +462,7 @@ def run_ydl_extract(url, opts):
             return {"ok": True, "info": info}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
 
 def yt_extract_info(url, cookiefile=None, try_browser_cookies=False):
     attempts = []
@@ -410,7 +490,6 @@ def yt_extract_info(url, cookiefile=None, try_browser_cookies=False):
         r_env = run_ydl_extract(url, opts)
         attempts.append(("env_cookiefile", r_env))
         if r_env.get("ok"):
-            # cleanup later by caller if needed
             return {"info": r_env["info"], "attempts": attempts}
     # 3) try browser cookies if allowed
     if try_browser_cookies and BROWSER_COOKIE3_AVAILABLE:
@@ -438,9 +517,14 @@ def yt_extract_info(url, cookiefile=None, try_browser_cookies=False):
     r4 = run_ydl_extract(url, opts)
     attempts.append(("allow_unplayable", r4))
     if r4.get("ok"):
+        if created_env_cookie:
+            try:
+                os.unlink(created_env_cookie)
+            except Exception:
+                pass
         return {"info": r4["info"], "attempts": attempts}
 
-    # cleanup env cookiefile if created (caller may still have it, but we clean here)
+    # cleanup env cookiefile if created
     if created_env_cookie:
         try:
             os.unlink(created_env_cookie)
@@ -448,6 +532,7 @@ def yt_extract_info(url, cookiefile=None, try_browser_cookies=False):
             pass
 
     return {"error": r4.get("error") or r1.get("error"), "attempts": attempts}
+
 
 def get_request_param(key, default=None):
     if key in request.form:
@@ -515,7 +600,6 @@ def info_route():
 
     # cleanup any cookiefile created by uploaded file or env
     if cookiefile_path and created_env_cookie:
-        # if it was created from env we remove it
         try:
             os.unlink(cookiefile_path)
         except Exception:
@@ -728,8 +812,6 @@ def download_route():
         finally:
             # cleanup cookiefile if it was created from env (we marked created_env_cookie earlier)
             if cookiefile:
-                # If cookiefile is the env-created tmp file, remove it. We can't easily know provenance here,
-                # so attempt to remove if it's under temp dir
                 try:
                     if str(cookiefile).startswith(tempfile.gettempdir()):
                         os.unlink(cookiefile)
@@ -830,6 +912,7 @@ def is_port_free(port, host="0.0.0.0"):
             return True
         except OSError:
             return False
+
 
 def pick_port(preferred=None, fallback_range=range(5001, 5011)):
     if preferred:
