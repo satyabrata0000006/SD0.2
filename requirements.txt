@@ -1,0 +1,4 @@
+Flask>=2.1
+yt-dlp
+browser_cookie3
+gunicorn
