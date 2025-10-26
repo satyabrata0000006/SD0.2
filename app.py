@@ -12,6 +12,7 @@ from pathlib import Path
 from flask import Flask, request, jsonify, send_file, render_template, send_from_directory
 import yt_dlp
 import html
+import http.cookiejar as cookiejar
 
 # Optional browser cookie support
 try:
@@ -81,9 +82,6 @@ def find_file_by_info(info):
 
 # ---------------- ffprobe / QuickTime compatibility helpers ----------------
 def ffprobe_codecs(path: Path):
-    """
-    Return dict: {"video": "<vcodec>" or None, "audio": "<acodec>" or None}
-    """
     try:
         cmd_v = ["ffprobe", "-v", "error", "-select_streams", "v:0",
                  "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", str(path)]
@@ -100,28 +98,23 @@ def ffprobe_codecs(path: Path):
         return None
 
 def is_quicktime_compatible(codecs: dict):
-    """
-    Heuristic: QuickTime-friendly if H.264/AVC (avc1/h264) + AAC/mp3.
-    """
     if not codecs:
         return False
     v = (codecs.get("video") or "").lower()
     a = (codecs.get("audio") or "").lower()
 
     if not v:
-        # audio-only
         if "aac" in a or "mp3" in a or "mp4a" in a:
             return True
         return False
 
     if ("h264" in v) or ("avc1" in v) or ("avc" in v):
-        if not a:  # video-only h264 is fine
+        if not a:
             return True
         if "aac" in a or "mp3" in a or "mp4a" in a:
             return True
         return False
 
-    # vp8/vp9/av1 typically not QuickTime-friendly
     return False
 
 # ---------------- Container choice + remux/re-encode ----------------
@@ -149,31 +142,22 @@ def choose_best_container(info):
     return "mp4"
 
 def remux_or_encode(task_id, src_path: Path, desired_ext: str, reencode_on_fail=True):
-    """
-    1) Try fast remux (ffmpeg -c copy) to desired_ext
-    2) If remuxed file not QuickTime-compatible (or remux failed), optionally re-encode to H.264 + AAC mp4
-    Returns Path to final file (may be original)
-    """
     try:
         add_task_message(task_id, f"Preparing container: target .{desired_ext}")
         cur_ext = src_path.suffix.lstrip(".").lower()
-        # If already desired extension, still check codecs
         if cur_ext == desired_ext:
             add_task_message(task_id, f"File already .{cur_ext}; checking codecs for compatibility...")
             codecs = ffprobe_codecs(src_path)
             if codecs and is_quicktime_compatible(codecs):
                 add_task_message(task_id, "Already QuickTime-compatible; no action needed.")
                 return src_path
-            # else continue to remux/re-encode
 
-        # Check ffmpeg availability
         rc, out, err = run_subprocess(["ffmpeg", "-version"])
         if rc != 0:
             add_task_message(task_id, "ffmpeg not available; cannot remux/re-encode. Serving original.")
             app.logger.warning("ffmpeg not available: %s", err)
             return src_path
 
-        # Attempt fast remux (copy)
         base = src_path.stem
         outname = DOWNLOAD_DIR / f"{base}.{desired_ext}"
         i = 1
@@ -212,7 +196,6 @@ def remux_or_encode(task_id, src_path: Path, desired_ext: str, reencode_on_fail=
                 return outname
             return src_path
 
-        # Re-encode to H.264 + AAC mp4
         add_task_message(task_id, "Re-encoding to H.264 + AAC (.mp4). This may take long for large files.")
         enc_out = DOWNLOAD_DIR / f"{base}.mp4"
         j = 1
@@ -255,6 +238,87 @@ def remux_or_encode(task_id, src_path: Path, desired_ext: str, reencode_on_fail=
         add_task_message(task_id, f"Remux/encode exception: {e}")
         return src_path
 
+# ---------------- Cookie helpers ----------------
+def export_browser_cookies_for_domain(domain: str, out_path: str) -> bool:
+    """
+    Export cookies from local browsers using browser_cookie3 into a Netscape-format cookies.txt file.
+    Returns True on success, False otherwise.
+    """
+    if not BROWSER_COOKIE3_AVAILABLE:
+        return False
+    try:
+        cj = cookiejar.MozillaCookieJar()
+        # browser_cookie3 provides cookiejar objects per-browser; try common ones
+        # Use a single combined cookiejar by iterating cookies from browser_cookie3
+        cjs = []
+        try:
+            cjs.append(browser_cookie3.chrome(domain_name=domain))
+        except Exception:
+            pass
+        try:
+            cjs.append(browser_cookie3.firefox(domain_name=domain))
+        except Exception:
+            pass
+        try:
+            cjs.append(browser_cookie3.edge(domain_name=domain))
+        except Exception:
+            pass
+        # fallback: all available
+        if not cjs:
+            try:
+                cjs.append(browser_cookie3.load())
+            except Exception:
+                pass
+
+        for jar in cjs:
+            for c in jar:
+                # create MozillaCookieJar cookie
+                m = cookiejar.Cookie(
+                    version=0, name=c.name, value=c.value,
+                    port=None, port_specified=False,
+                    domain=c.domain, domain_specified=bool(c.domain),
+                    domain_initial_dot=c.domain.startswith(".") if c.domain else False,
+                    path=c.path or "/", path_specified=True,
+                    secure=c.secure, expires=c.expires,
+                    discard=False, comment=None, comment_url=None,
+                    rest={}, rfc2109=False
+                )
+                cj.set_cookie(m)
+        cj.save(out_path, ignore_discard=True, ignore_expires=True)
+        return True
+    except Exception:
+        app.logger.exception("export_browser_cookies_for_domain failed")
+        return False
+
+def make_cookiefile_from_env() -> str | None:
+    """
+    Create a temp cookies.txt file from env var YTDLP_COOKIES (raw content) or return
+    YTDLP_COOKIES_FILE if that points to an existing file.
+    Caller should unlink returned path when done.
+    """
+    # 1) prefer explicit file path env
+    file_path = os.environ.get("YTDLP_COOKIES_FILE")
+    if file_path:
+        if os.path.exists(file_path):
+            return file_path
+    # 2) raw cookie content env var
+    raw = os.environ.get("YTDLP_COOKIES")
+    if raw:
+        try:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+            tmp.close()
+            with open(tmp.name, "w", encoding="utf-8") as fh:
+                fh.write(raw)
+            return tmp.name
+        except Exception:
+            app.logger.exception("make_cookiefile_from_env failed to write tmp file")
+            try:
+                os.unlink(tmp.name)
+            except Exception:
+                pass
+            return None
+    return None
+
 # ---------------- yt-dlp options ----------------
 def prepare_yt_dlp_opts(cookiefile=None, output_template=None, allow_unplayable=False,
                         extra_headers=None, progress_hook=None, format_override=None,
@@ -284,8 +348,14 @@ def prepare_yt_dlp_opts(cookiefile=None, output_template=None, allow_unplayable=
         "geo_bypass": True,
         "http_headers": default_headers,
         "merge_output_format": merge_output_format,
+        # allow yt-dlp to pass ffmpeg copy flags if merging
         "postprocessor_args": ["-c", "copy", "-movflags", "faststart", "-threads", "2"],
     }
+
+    # Proxy support via env var YTDLP_PROXY or HTTP_PROXY/HTTPS_PROXY
+    proxy = os.environ.get("YTDLP_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY")
+    if proxy:
+        opts["proxy"] = proxy
 
     if audio_convert:
         opts["postprocessors"] = [{
@@ -316,20 +386,37 @@ def run_ydl_extract(url, opts):
 
 def yt_extract_info(url, cookiefile=None, try_browser_cookies=False):
     attempts = []
+    # 0) try with no cookies
     opts = prepare_yt_dlp_opts()
     r1 = run_ydl_extract(url, opts)
     attempts.append(("no_cookies", r1))
     if r1.get("ok"):
         return {"info": r1["info"], "attempts": attempts}
+
+    created_env_cookie = None
+    # 1) try uploaded cookiefile if provided
     if cookiefile:
         opts = prepare_yt_dlp_opts(cookiefile=cookiefile)
         r2 = run_ydl_extract(url, opts)
         attempts.append(("user_cookiefile", r2))
         if r2.get("ok"):
             return {"info": r2["info"], "attempts": attempts}
+
+    # 2) try env-provided cookies
+    env_cookie_path = make_cookiefile_from_env()
+    if env_cookie_path:
+        created_env_cookie = env_cookie_path
+        opts = prepare_yt_dlp_opts(cookiefile=env_cookie_path)
+        r_env = run_ydl_extract(url, opts)
+        attempts.append(("env_cookiefile", r_env))
+        if r_env.get("ok"):
+            # cleanup later by caller if needed
+            return {"info": r_env["info"], "attempts": attempts}
+    # 3) try browser cookies if allowed
     if try_browser_cookies and BROWSER_COOKIE3_AVAILABLE:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
         tmp.close()
+        ok = False
         try:
             ok = export_browser_cookies_for_domain("youtube.com", tmp.name)
         except Exception:
@@ -344,11 +431,22 @@ def yt_extract_info(url, cookiefile=None, try_browser_cookies=False):
                 pass
             if r3.get("ok"):
                 return {"info": r3["info"], "attempts": attempts}
-    opts = prepare_yt_dlp_opts(cookiefile=cookiefile, allow_unplayable=True)
+
+    # 4) last: allow unplayable fallback
+    env_cookie_for_cleanup = created_env_cookie
+    opts = prepare_yt_dlp_opts(cookiefile=created_env_cookie, allow_unplayable=True)
     r4 = run_ydl_extract(url, opts)
     attempts.append(("allow_unplayable", r4))
     if r4.get("ok"):
         return {"info": r4["info"], "attempts": attempts}
+
+    # cleanup env cookiefile if created (caller may still have it, but we clean here)
+    if created_env_cookie:
+        try:
+            os.unlink(created_env_cookie)
+        except Exception:
+            pass
+
     return {"error": r4.get("error") or r1.get("error"), "attempts": attempts}
 
 def get_request_param(key, default=None):
@@ -389,6 +487,7 @@ def info_route():
         return jsonify({"ok": False, "error": "url parameter missing"}), 400
 
     cookiefile_path = None
+    created_env_cookie = None
     if "cookies" in request.files:
         f = request.files["cookies"]
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
@@ -398,18 +497,34 @@ def info_route():
     try_browser = str(get_request_param("try_browser_cookies", "0")).lower() in ("1", "true", "yes")
 
     try:
+        # If no uploaded cookiefile, try to create one from env for this request
+        if not cookiefile_path:
+            env_path = make_cookiefile_from_env()
+            if env_path:
+                cookiefile_path = env_path
+                created_env_cookie = env_path
+
         result = yt_extract_info(url, cookiefile=cookiefile_path, try_browser_cookies=try_browser)
     except Exception as e:
         tb = traceback.format_exc()
         app.logger.exception("Exception in info_route")
-        if cookiefile_path:
+        if cookiefile_path and created_env_cookie:
             try: os.unlink(cookiefile_path)
             except: pass
         return jsonify({"ok": False, "error": "internal_error", "detail": str(e), "trace": tb}), 500
 
-    if cookiefile_path:
-        try: os.unlink(cookiefile_path)
-        except: pass
+    # cleanup any cookiefile created by uploaded file or env
+    if cookiefile_path and created_env_cookie:
+        # if it was created from env we remove it
+        try:
+            os.unlink(cookiefile_path)
+        except Exception:
+            pass
+    elif cookiefile_path and "cookies" in request.files:
+        try:
+            os.unlink(cookiefile_path)
+        except Exception:
+            pass
 
     if "info" in result:
         info = result["info"]
@@ -436,6 +551,7 @@ def download_route():
 
     requested = get_request_param("requested")
     cookiefile_path = None
+    created_env_cookie = None
     if "cookies" in request.files:
         f = request.files["cookies"]
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
@@ -445,10 +561,17 @@ def download_route():
     try_browser = str(get_request_param("try_browser_cookies", "0")).lower() in ("1", "true", "yes")
 
     try:
+        # If no uploaded cookiefile, try to create one from env for this request
+        if not cookiefile_path:
+            env_path = make_cookiefile_from_env()
+            if env_path:
+                cookiefile_path = env_path
+                created_env_cookie = env_path
+
         info_result = yt_extract_info(url, cookiefile=cookiefile_path, try_browser_cookies=try_browser)
     except Exception as e:
         app.logger.exception("Failed to prefetch info for download")
-        if cookiefile_path:
+        if cookiefile_path and created_env_cookie:
             try: os.unlink(cookiefile_path)
             except: pass
         return jsonify({"ok": False, "error": "prefetch_failed", "detail": str(e)}), 500
@@ -567,6 +690,7 @@ def download_route():
                 if ok:
                     try:
                         add_task_message(tid, "Trying with local browser cookies")
+                        # prefer browser cookiefile for this attempt
                         attempt_download(None, audio_conv)
                         try: os.unlink(tmp.name)
                         except: pass
@@ -602,9 +726,15 @@ def download_route():
             TASKS[tid].update({"status": "error", "error": str(e)})
             add_task_message(tid, f"Worker exception: {str(e)}")
         finally:
+            # cleanup cookiefile if it was created from env (we marked created_env_cookie earlier)
             if cookiefile:
-                try: os.unlink(cookiefile)
-                except: pass
+                # If cookiefile is the env-created tmp file, remove it. We can't easily know provenance here,
+                # so attempt to remove if it's under temp dir
+                try:
+                    if str(cookiefile).startswith(tempfile.gettempdir()):
+                        os.unlink(cookiefile)
+                except Exception:
+                    pass
 
     th = threading.Thread(target=worker, args=(task_id, url, cookiefile_path, try_browser, fmt_to_use, audio_convert, info), daemon=True)
     th.start()
