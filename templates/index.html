@@ -1,9 +1,9 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Social Media Downloader</title>
+  <title>Satyabrata — Social Media Downloader</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
     .spinner { border:3px solid #f3f3f3; border-top:3px solid #2563eb; border-radius:50%; width:16px; height:16px; animation:spin .8s linear infinite; display:inline-block; vertical-align:middle; margin-right:6px;}
@@ -14,7 +14,10 @@
 </head>
 <body class="bg-gray-100 min-h-screen flex items-center justify-center p-6">
   <div class="w-full max-w-2xl bg-white rounded-xl shadow p-6">
-    <h1 class="text-2xl font-semibold mb-3">🎬 Social Media Downloader</h1>
+    <header class="mb-4">
+      <h1 class="text-2xl font-semibold mb-1">🎬 Social Media Downloader</h1>
+      <div class="text-sm text-gray-600">Built by <strong>Satyabrata</strong>. Paste a public or signed-in URL (YouTube, Instagram, Facebook...).</div>
+    </header>
 
     <input id="urlInput" class="w-full border rounded p-2 mb-3" placeholder="Paste video URL (YouTube, Instagram, Facebook...)" />
 
@@ -67,6 +70,11 @@
     <div class="mt-4">
       <label class="block mb-1 text-sm font-medium">Live log</label>
       <div id="liveLog" class="log"></div>
+    </div>
+
+    <hr class="my-4" />
+    <div class="text-sm text-gray-600">
+      If a link requires sign-in or CAPTCHA, click <a href="/upload_cookies" class="text-blue-600 underline" id="uploadLink" target="_blank">Upload cookies</a> and follow the instructions to provide a Netscape `cookies.txt`.
     </div>
   </div>
 
