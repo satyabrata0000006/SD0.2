@@ -12,7 +12,6 @@ from pathlib import Path
 from flask import Flask, request, jsonify, send_file, render_template, send_from_directory
 import yt_dlp
 import html
-import http.cookiejar as cookiejar
 import json
 import base64
 
@@ -37,14 +36,12 @@ TASK_LOCK = threading.Lock()
 def safe_basename(path: str) -> str:
     return Path(path).name
 
-
 def add_task_message(task_id, text):
     t = TASKS.get(task_id)
     if t is None:
         return
     msgs = t.setdefault("messages", [])
     msgs.append({"ts": int(time.time()), "text": text})
-
 
 def run_subprocess(cmd, env=None, timeout=None):
     try:
@@ -58,7 +55,6 @@ def run_subprocess(cmd, env=None, timeout=None):
         return 124, "", f"timeout: {e}"
     except Exception as e:
         return 1, "", str(e)
-
 
 def find_file_by_info(info):
     try:
@@ -101,7 +97,6 @@ def ffprobe_codecs(path: Path):
         return {"video": vcodec, "audio": acodec}
     except Exception:
         return None
-
 
 def is_quicktime_compatible(codecs: dict):
     if not codecs:
@@ -146,7 +141,6 @@ def choose_best_container(info):
     if "av1" in vcodec:
         return "webm"
     return "mp4"
-
 
 def remux_or_encode(task_id, src_path: Path, desired_ext: str, reencode_on_fail=True):
     try:
@@ -259,12 +253,7 @@ def is_netscape_format(path: str) -> bool:
         pass
     return False
 
-
 def json_to_netscape(json_path: str, out_path: str) -> bool:
-    """
-    Convert cookie JSON (common exporter formats) to Netscape cookies.txt lines.
-    Returns True on success.
-    """
     try:
         with open(json_path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -277,7 +266,6 @@ def json_to_netscape(json_path: str, out_path: str) -> bool:
     elif isinstance(data, dict) and "cookies" in data and isinstance(data["cookies"], list):
         lst = data["cookies"]
     else:
-        # try to find list value
         for v in data.values():
             if isinstance(v, list):
                 lst = v
@@ -312,23 +300,13 @@ def json_to_netscape(json_path: str, out_path: str) -> bool:
     except Exception:
         return False
 
-
 def make_cookiefile_from_env() -> str | None:
-    """
-    Create a temp cookies.txt file from env var YTDLP_COOKIES (raw content),
-    YTDLP_COOKIES_FILE, or base64 var YTDLP_COOKIES_B64.
-    Returns path to cookiefile, or None.
-    Caller should unlink returned path when done.
-    """
-    # 1) explicit file path env
     file_path = os.environ.get("YTDLP_COOKIES_FILE")
     if file_path:
         if os.path.exists(file_path):
-            # validate netscape, if not and looks like json try conversion
             if is_netscape_format(file_path):
                 return file_path
             else:
-                # try convert json to netscape into tmp file
                 tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
                 tmp.close()
                 ok = json_to_netscape(file_path, tmp.name)
@@ -341,7 +319,6 @@ def make_cookiefile_from_env() -> str | None:
                         pass
                     return None
 
-    # 2) base64 env var - preferred for UI newline issues
     b64 = os.environ.get("YTDLP_COOKIES_B64")
     if b64:
         try:
@@ -350,10 +327,8 @@ def make_cookiefile_from_env() -> str | None:
             tmp.close()
             with open(tmp.name, "wb") as fh:
                 fh.write(data)
-            # validate
             if is_netscape_format(tmp.name):
                 return tmp.name
-            # try json convert
             conv_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
             conv_tmp.close()
             ok = json_to_netscape(tmp.name, conv_tmp.name)
@@ -364,12 +339,10 @@ def make_cookiefile_from_env() -> str | None:
                     pass
                 return conv_tmp.name
             else:
-                # keep original (maybe still valid)
                 return tmp.name
         except Exception:
             return None
 
-    # 3) raw env var
     raw = os.environ.get("YTDLP_COOKIES")
     if raw:
         try:
@@ -379,7 +352,6 @@ def make_cookiefile_from_env() -> str | None:
                 fh.write(raw)
             if is_netscape_format(tmp.name):
                 return tmp.name
-            # try json->netscape
             conv_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
             conv_tmp.close()
             ok = json_to_netscape(tmp.name, conv_tmp.name)
@@ -454,7 +426,6 @@ def prepare_yt_dlp_opts(cookiefile=None, output_template=None, allow_unplayable=
 
     return opts
 
-
 def run_ydl_extract(url, opts):
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -463,10 +434,8 @@ def run_ydl_extract(url, opts):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-
 def yt_extract_info(url, cookiefile=None, try_browser_cookies=False):
     attempts = []
-    # 0) try with no cookies
     opts = prepare_yt_dlp_opts()
     r1 = run_ydl_extract(url, opts)
     attempts.append(("no_cookies", r1))
@@ -474,7 +443,6 @@ def yt_extract_info(url, cookiefile=None, try_browser_cookies=False):
         return {"info": r1["info"], "attempts": attempts}
 
     created_env_cookie = None
-    # 1) try uploaded cookiefile if provided
     if cookiefile:
         opts = prepare_yt_dlp_opts(cookiefile=cookiefile)
         r2 = run_ydl_extract(url, opts)
@@ -482,7 +450,6 @@ def yt_extract_info(url, cookiefile=None, try_browser_cookies=False):
         if r2.get("ok"):
             return {"info": r2["info"], "attempts": attempts}
 
-    # 2) try env-provided cookies
     env_cookie_path = make_cookiefile_from_env()
     if env_cookie_path:
         created_env_cookie = env_cookie_path
@@ -491,7 +458,7 @@ def yt_extract_info(url, cookiefile=None, try_browser_cookies=False):
         attempts.append(("env_cookiefile", r_env))
         if r_env.get("ok"):
             return {"info": r_env["info"], "attempts": attempts}
-    # 3) try browser cookies if allowed
+
     if try_browser_cookies and BROWSER_COOKIE3_AVAILABLE:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
         tmp.close()
@@ -511,7 +478,6 @@ def yt_extract_info(url, cookiefile=None, try_browser_cookies=False):
             if r3.get("ok"):
                 return {"info": r3["info"], "attempts": attempts}
 
-    # 4) last: allow unplayable fallback
     env_cookie_for_cleanup = created_env_cookie
     opts = prepare_yt_dlp_opts(cookiefile=created_env_cookie, allow_unplayable=True)
     r4 = run_ydl_extract(url, opts)
@@ -524,7 +490,6 @@ def yt_extract_info(url, cookiefile=None, try_browser_cookies=False):
                 pass
         return {"info": r4["info"], "attempts": attempts}
 
-    # cleanup env cookiefile if created
     if created_env_cookie:
         try:
             os.unlink(created_env_cookie)
@@ -532,7 +497,6 @@ def yt_extract_info(url, cookiefile=None, try_browser_cookies=False):
             pass
 
     return {"error": r4.get("error") or r1.get("error"), "attempts": attempts}
-
 
 def get_request_param(key, default=None):
     if key in request.form:
@@ -564,6 +528,70 @@ def favicon():
         return send_from_directory(str(static_dir), "favicon.ico")
     return ("", 204)
 
+@app.route("/upload_cookies", methods=["GET"])
+def upload_cookies_page():
+    # simple upload HTML (keeps templates small)
+    html_page = """
+    <!doctype html>
+    <html>
+      <head><meta charset="utf-8"/><title>Upload cookies</title></head>
+      <body>
+        <h2>Upload cookies.txt (Netscape format)</h2>
+        <form method="post" enctype="multipart/form-data" action="/upload_cookies">
+          <label>cookies.txt: <input type="file" name="cookies" accept=\".txt\" required /></label><br/>
+          <label>Test URL (optional): <input type="text" name="url" style="width:70%" placeholder="https://..."/></label><br/>
+          <button type="submit">Upload & Try</button>
+        </form>
+        <p>After a successful upload the cookie will be saved to <code>/tmp/cookies.txt</code> for subsequent requests.</p>
+      </body>
+    </html>
+    """
+    return html_page
+
+@app.route("/upload_cookies", methods=["POST"])
+def upload_cookies_handler():
+    if "cookies" not in request.files:
+        return jsonify({"ok": False, "error": "no_file", "message": "No file field named 'cookies'"}), 400
+
+    f = request.files["cookies"]
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+    try:
+        f.save(tmp.name)
+        tmp.close()
+    except Exception as e:
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
+        return jsonify({"ok": False, "error": "save_failed", "detail": str(e)}), 500
+
+    url = request.form.get("url") or request.args.get("url")
+    if url:
+        # try using uploaded cookie to get info
+        res = yt_extract_info(url, cookiefile=tmp.name, try_browser_cookies=False)
+    else:
+        res = {"ok": False, "error": "no_test_url"}
+
+    if res.get("info"):
+        # move to /tmp/cookies.txt for server use
+        try:
+            final = "/tmp/cookies.txt"
+            with open(tmp.name, "rb") as r, open(final, "wb") as w:
+                w.write(r.read())
+            os.chmod(final, 0o600)
+            try: os.unlink(tmp.name)
+            except: pass
+            info = res["info"]
+            return jsonify({"ok": True, "message": "Saved to /tmp/cookies.txt", "id": info.get("id"), "title": info.get("title")}), 200
+        except Exception as e:
+            return jsonify({"ok": False, "error": "save_failed", "detail": str(e)}), 500
+    else:
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
+        return jsonify({"ok": False, "error": "cookie_invalid", "detail": res.get("error")}), 422
+
 @app.route("/info", methods=["POST"])
 @app.route("/get_info", methods=["POST"])
 def info_route():
@@ -582,7 +610,6 @@ def info_route():
     try_browser = str(get_request_param("try_browser_cookies", "0")).lower() in ("1", "true", "yes")
 
     try:
-        # If no uploaded cookiefile, try to create one from env for this request
         if not cookiefile_path:
             env_path = make_cookiefile_from_env()
             if env_path:
@@ -598,7 +625,6 @@ def info_route():
             except: pass
         return jsonify({"ok": False, "error": "internal_error", "detail": str(e), "trace": tb}), 500
 
-    # cleanup any cookiefile created by uploaded file or env
     if cookiefile_path and created_env_cookie:
         try:
             os.unlink(cookiefile_path)
@@ -625,6 +651,11 @@ def info_route():
             "attempts": result.get("attempts", []),
         }), 200
     else:
+        # If yt-dlp indicates "sign in" or captcha-like message, return a clear error
+        err = result.get("error", "") or ""
+        low = str(err).lower()
+        if "sign in to confirm" in low or "confirm you" in low or "not a bot" in low or "sign in" in low and "cookie" in low:
+            return jsonify({"ok": False, "error": "sign_in_required", "message": "Server requires signed-in cookies or manual CAPTCHA. Please upload a cookies.txt via /upload_cookies."}), 422
         return jsonify({"ok": False, "error": result.get("error", "unknown"), "attempts": result.get("attempts", [])}), 422
 
 @app.route("/download", methods=["POST"])
@@ -645,7 +676,6 @@ def download_route():
     try_browser = str(get_request_param("try_browser_cookies", "0")).lower() in ("1", "true", "yes")
 
     try:
-        # If no uploaded cookiefile, try to create one from env for this request
         if not cookiefile_path:
             env_path = make_cookiefile_from_env()
             if env_path:
@@ -774,7 +804,6 @@ def download_route():
                 if ok:
                     try:
                         add_task_message(tid, "Trying with local browser cookies")
-                        # prefer browser cookiefile for this attempt
                         attempt_download(None, audio_conv)
                         try: os.unlink(tmp.name)
                         except: pass
@@ -810,7 +839,6 @@ def download_route():
             TASKS[tid].update({"status": "error", "error": str(e)})
             add_task_message(tid, f"Worker exception: {str(e)}")
         finally:
-            # cleanup cookiefile if it was created from env (we marked created_env_cookie earlier)
             if cookiefile:
                 try:
                     if str(cookiefile).startswith(tempfile.gettempdir()):
@@ -821,7 +849,6 @@ def download_route():
     th = threading.Thread(target=worker, args=(task_id, url, cookiefile_path, try_browser, fmt_to_use, audio_convert, info), daemon=True)
     th.start()
 
-    # Monitor thread
     def monitor():
         while True:
             t = TASKS.get(task_id)
@@ -833,7 +860,7 @@ def download_route():
             last = t.get("last_progress_time", t.get("created", time.time()))
             default_timeout = 180
             if status == "processing":
-                timeout = 900  # 15 minutes for processing; increase if large files often
+                timeout = 900
             else:
                 timeout = default_timeout
             if time.time() - last > timeout:
@@ -912,7 +939,6 @@ def is_port_free(port, host="0.0.0.0"):
             return True
         except OSError:
             return False
-
 
 def pick_port(preferred=None, fallback_range=range(5001, 5011)):
     if preferred:
