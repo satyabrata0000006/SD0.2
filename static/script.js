@@ -46,6 +46,7 @@ const autoCookieBtnEl = document.getElementById("autoCookieBtn");
 const liveLog = document.getElementById("liveLog");
 const hintArea = document.getElementById("hintArea");
 const hintText = document.getElementById("hintText");
+const uploadLink = document.getElementById("uploadLink");
 
 function showSpinner(btn, text) { btn.innerHTML = `<span class="spinner"></span> ${text}`; }
 function resetButton(btn, text) { btn.innerHTML = text; }
@@ -95,7 +96,19 @@ getInfoBtn.addEventListener("click", async () => {
 
     const res = await fetch("/info", { method: "POST", body: fd });
     const data = await res.json();
-    if (!data.ok) throw new Error(data.error || "No info");
+
+    if (!data.ok) {
+      // If server says sign-in/captcha required, show helpful hint and open upload page
+      if (data.error === "sign_in_required" || (data.message && data.message.toLowerCase().includes("sign-in"))) {
+        appendLog("Server requires signed-in cookies -> opening upload page.");
+        alert("This link needs signed-in cookies (or manual CAPTCHA). You'll be taken to the Upload Cookies page. Upload a Netscape cookies.txt from a browser where you're signed in.");
+        // open in new tab so user can follow steps
+        window.open("/upload_cookies", "_blank");
+        statusText.innerText = "❌ Sign-in required — upload cookies (opened upload page)";
+        return;
+      }
+      throw new Error(data.error || data.message || "No info");
+    }
 
     infoSection.classList.remove("hidden");
     thumb.src = data.thumbnail || "";
