@@ -29,9 +29,6 @@ TASKS = {}
 TASK_LOCK = threading.Lock()
 
 # ---------------- Utilities ----------------
-def safe_basename(path: str) -> str:
-    return Path(path).name
-
 def add_task_message(task_id, text):
     t = TASKS.get(task_id)
     if not t:
@@ -39,30 +36,27 @@ def add_task_message(task_id, text):
     msgs = t.setdefault("messages", [])
     msgs.append({"ts": int(time.time()), "text": text})
 
-def run_subprocess(cmd, env=None, timeout=None):
+def run_subprocess(cmd, timeout=None):
     try:
-        if isinstance(cmd, str):
-            cmd_list = shlex.split(cmd)
-        else:
-            cmd_list = cmd
-        proc = subprocess.run(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, env=env, timeout=timeout)
-        return proc.returncode, proc.stdout.decode(errors='ignore'), proc.stderr.decode(errors='ignore')
-    except subprocess.TimeoutExpired as e:
-        return 124, "", f"timeout: {e}"
+        proc = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, check=False, timeout=timeout)
+        return proc.returncode, proc.stdout.decode(errors="ignore"), proc.stderr.decode(errors="ignore")
     except Exception as e:
         return 1, "", str(e)
 
-# ---------------- Cookie Helpers ----------------
+# ---------------- Cookie helpers ----------------
 def export_browser_cookies_for_domain(domain: str, out_path: str) -> bool:
     if not BROWSER_COOKIE3_AVAILABLE:
         return False
     try:
         jars = []
-        for getter in [browser_cookie3.chrome, browser_cookie3.edge, browser_cookie3.firefox,
-                       browser_cookie3.brave, browser_cookie3.opera]:
+        for getter in [browser_cookie3.chrome, browser_cookie3.edge,
+                       browser_cookie3.firefox, browser_cookie3.brave,
+                       browser_cookie3.opera]:
             try:
                 jar = getter(domain_name=domain)
-                if jar: jars.append(jar)
+                if jar:
+                    jars.append(jar)
             except Exception:
                 continue
         cookies = []
@@ -87,10 +81,9 @@ def export_browser_cookies_for_domain(domain: str, out_path: str) -> bool:
         app.logger.exception("export_browser_cookies_for_domain failed")
         return False
 
-
 @app.route("/default_cookies", methods=["GET"])
 def default_cookies_route():
-    """Serve cookies.txt from the same folder as app.py"""
+    """Serve cookies.txt from same folder as app.py"""
     base_dir = Path(__file__).parent
     candidates = [
         base_dir / "cookies.txt",
@@ -102,17 +95,15 @@ def default_cookies_route():
             return send_file(str(p), mimetype="text/plain")
     return ("", 404)
 
-
 # ---------------- yt-dlp helpers ----------------
 def prepare_yt_dlp_opts(cookiefile=None, output_template=None,
                         progress_hook=None, format_override=None,
-                        audio_convert=None, merge_output_format="mp4"):
+                        audio_convert=None):
     opts = {
         "format": format_override or "bestvideo+bestaudio/best",
         "quiet": True,
         "no_warnings": True,
         "outtmpl": output_template or str(DOWNLOAD_DIR / "%(title)s - %(id)s.%(ext)s"),
-        "merge_output_format": merge_output_format,
         "http_headers": {"User-Agent": "Mozilla/5.0"},
     }
     if cookiefile:
@@ -127,7 +118,6 @@ def prepare_yt_dlp_opts(cookiefile=None, output_template=None,
         opts["progress_hooks"] = [progress_hook]
     return opts
 
-
 def run_ydl_extract(url, opts):
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -135,7 +125,6 @@ def run_ydl_extract(url, opts):
             return {"ok": True, "info": info}
     except Exception as e:
         return {"ok": False, "error": str(e)}
-
 
 # ---------------- Routes ----------------
 @app.route("/")
@@ -149,7 +138,6 @@ def favicon():
     if fav.exists():
         return send_from_directory(str(static_dir), "favicon.ico")
     return ("", 204)
-
 
 @app.route("/info", methods=["POST"])
 def info_route():
@@ -168,8 +156,10 @@ def info_route():
     result = run_ydl_extract(url, opts)
 
     if cookiefile:
-        try: os.unlink(cookiefile)
-        except Exception: pass
+        try:
+            os.unlink(cookiefile)
+        except Exception:
+            pass
 
     if result.get("ok"):
         info = result["info"]
@@ -183,8 +173,7 @@ def info_route():
             "formats": info.get("formats", [])
         })
     else:
-        return jsonify({"ok": False, "error": result.get("error")})
-
+        return jsonify({"ok": False, "error": result.get("error")}), 422
 
 @app.route("/download", methods=["POST"])
 def download_route():
@@ -208,10 +197,7 @@ def download_route():
         if d.get("status") == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             done = d.get("downloaded_bytes", 0)
-            if total:
-                pct = int(done * 100 / total)
-            else:
-                pct = 0
+            pct = int(done * 100 / total) if total else 0
             TASKS[task_id]["progress"] = f"{pct}%"
         elif d.get("status") == "finished":
             TASKS[task_id]["progress"] = "100%"
@@ -224,19 +210,21 @@ def download_route():
                 info = ydl.extract_info(url, download=True)
                 filename = ydl.prepare_filename(info)
                 TASKS[task_id].update({
-                    "status": "done", "filename": Path(filename).name,
+                    "status": "done",
+                    "filename": Path(filename).name,
                     "info": {"title": info.get("title")}
                 })
         except Exception as e:
             TASKS[task_id].update({"status": "error", "error": str(e)})
         finally:
             if cookiefile:
-                try: os.unlink(cookiefile)
-                except Exception: pass
+                try:
+                    os.unlink(cookiefile)
+                except Exception:
+                    pass
 
     threading.Thread(target=worker, daemon=True).start()
     return jsonify({"ok": True, "task_id": task_id})
-
 
 @app.route("/task/<tid>")
 def task_status(tid):
@@ -244,7 +232,6 @@ def task_status(tid):
     if not t:
         return jsonify({"ok": False, "error": "no such task"})
     return jsonify({"ok": True, "task": t})
-
 
 @app.route("/download_file/<filename>")
 def serve_file(filename):
@@ -254,8 +241,18 @@ def serve_file(filename):
         return send_file(str(path), as_attachment=True)
     return jsonify({"ok": False, "error": "file not found"}), 404
 
+# ---------- Global JSON Error Handlers ----------
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"ok": False, "error": "not_found", "detail": str(e)}), 404
+
+@app.errorhandler(500)
+def server_error(e):
+    tb = traceback.format_exc()
+    app.logger.error("Server error: %s", tb)
+    return jsonify({"ok": False, "error": "internal_server_error", "trace": tb}), 500
 
 if __name__ == "__main__":
-    port = 5000
+    port = int(os.environ.get("PORT", 5000))
     print(f"Server started at http://127.0.0.1:{port}")
     app.run(host="0.0.0.0", port=port)
