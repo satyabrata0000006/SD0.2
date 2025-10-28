@@ -3,7 +3,6 @@ const getInfoBtn = document.getElementById("getInfoBtn");
 const downloadBtn = document.getElementById("downloadBtn");
 const formatSelect = document.getElementById("formatSelect");
 const cookiesFile = document.getElementById("cookiesFile");
-const useBrowserCookies = document.getElementById("useBrowserCookies");
 const infoSection = document.getElementById("infoSection");
 const thumb = document.getElementById("thumb");
 const videoTitle = document.getElementById("videoTitle");
@@ -16,6 +15,7 @@ const liveLog = document.getElementById("liveLog");
 let defaultCookieBlob = null;
 let defaultCookieName = null;
 
+// ------- helper -------
 function appendLog(msg) {
   const ts = new Date().toLocaleTimeString();
   const div = document.createElement("div");
@@ -35,7 +35,7 @@ function showDefaultCookieLoaded(filename) {
   el.textContent = `✅ Default cookies loaded: ${filename}`;
 }
 
-// auto-load cookies.txt from same dir as app.py
+// ------- auto-load default cookies -------
 (async function tryLoadDefaultCookie(){
   try {
     const res = await fetch("/default_cookies");
@@ -46,10 +46,11 @@ function showDefaultCookieLoaded(filename) {
     showDefaultCookieLoaded(defaultCookieName);
     appendLog("Default cookies loaded from server");
   } catch (e) {
-    console.log("No default cookies available");
+    console.log("No default cookies found");
   }
 })();
 
+// ------- fetch info -------
 getInfoBtn.addEventListener("click", async () => {
   const url = urlInput.value.trim();
   if (!url) return alert("Paste a URL first!");
@@ -67,8 +68,14 @@ getInfoBtn.addEventListener("click", async () => {
     }
 
     const res = await fetch("/info", { method: "POST", body: fd });
+    const contentType = res.headers.get("content-type") || "";
+    if (!contentType.includes("application/json")) {
+      const text = await res.text();
+      throw new Error("Expected JSON but got HTML:\n" + text.slice(0,200));
+    }
     const data = await res.json();
-    if (!data.ok) throw new Error(data.error || "failed");
+
+    if (!data.ok) throw new Error(data.error || "Failed");
 
     infoSection.classList.remove("hidden");
     thumb.src = data.thumbnail || "";
@@ -93,6 +100,7 @@ getInfoBtn.addEventListener("click", async () => {
   }
 });
 
+// ------- download -------
 downloadBtn.addEventListener("click", async () => {
   const url = urlInput.value.trim();
   if (!url) return alert("Paste a URL first!");
@@ -113,6 +121,11 @@ downloadBtn.addEventListener("click", async () => {
     }
 
     const res = await fetch("/download", { method: "POST", body: fd });
+    const contentType = res.headers.get("content-type") || "";
+    if (!contentType.includes("application/json")) {
+      const text = await res.text();
+      throw new Error("Expected JSON but got HTML:\n" + text.slice(0,200));
+    }
     const data = await res.json();
     if (!data.ok) throw new Error(data.error || "failed");
 
