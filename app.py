@@ -4,8 +4,6 @@ import tempfile
 import threading
 import uuid
 import traceback
-import subprocess
-import shlex
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file, render_template, send_from_directory
 import yt_dlp
@@ -17,50 +15,68 @@ app.config["JSON_SORT_KEYS"] = False
 BASE_DIR = Path(__file__).parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
+
 TASKS = {}
 TASK_LOCK = threading.Lock()
 
-# ---------------- Cookie Setup ----------------
-def write_text_file(path: Path, data: str | bytes):
+
+# ---------------- Cookie helpers ----------------
+def write_text_file(path: Path, data: bytes | str):
     path.parent.mkdir(parents=True, exist_ok=True)
-    mode = "wb" if isinstance(data, (bytes, bytearray)) else "w"
-    with open(path, mode, encoding=None if mode == "wb" else "utf-8") as f:
-        f.write(data)
+    if isinstance(data, (bytes, bytearray)):
+        with open(path, "wb") as f:
+            f.write(data)
+    else:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(data)
 
 def ensure_cookies_from_env_once() -> str | None:
-    """Restore cookies.txt from ENV or COOKIES_URL"""
+    """
+    Restore cookies.txt into /tmp/cookies.txt from env or COOKIES_URL.
+    Return the path if created.
+    """
     try:
         target = Path("/tmp/cookies.txt")
         b64 = os.environ.get("YTDLP_COOKIES_B64")
         raw = os.environ.get("YTDLP_COOKIES")
+        url = os.environ.get("COOKIES_URL")
 
         if b64:
             data = base64.b64decode(b64)
             write_text_file(target, data)
-            app.logger.info("✅ Cookies.txt restored from YTDLP_COOKIES_B64 → /tmp/cookies.txt")
+            app.logger.info("✅ Cookies from YTDLP_COOKIES_B64 -> /tmp/cookies.txt")
             return str(target)
-        elif raw:
+
+        if raw:
             write_text_file(target, raw)
-            app.logger.info("✅ Cookies.txt restored from YTDLP_COOKIES → /tmp/cookies.txt")
+            app.logger.info("✅ Cookies from YTDLP_COOKIES -> /tmp/cookies.txt")
             return str(target)
-        else:
-            url = os.environ.get("COOKIES_URL")
-            if url:
-                import urllib.request
-                with urllib.request.urlopen(url, timeout=10) as r:
+
+        if url:
+            import urllib.request
+            try:
+                with urllib.request.urlopen(url, timeout=12) as r:
                     data = r.read()
                     if data and len(data) > 10:
                         write_text_file(target, data)
-                        app.logger.info("✅ Cookies.txt downloaded from COOKIES_URL → /tmp/cookies.txt")
+                        app.logger.info("✅ Cookies downloaded from COOKIES_URL -> /tmp/cookies.txt")
                         return str(target)
-            return None
+            except Exception as e:
+                app.logger.warning(f"COOKIES_URL fetch failed: {e}")
+
+        return None
     except Exception as e:
-        app.logger.error(f"Cookie setup failed: {e}")
+        app.logger.error(f"ensure_cookies_from_env_once failed: {e}")
         return None
 
 ensure_cookies_from_env_once()
 
-# ---------------- yt-dlp Options ----------------
+
+def cookie_candidates():
+    return [Path("/tmp/cookies.txt"), BASE_DIR / "cookies.txt", Path("/mnt/data/cookies.txt")]
+
+
+# ---------------- yt-dlp helpers ----------------
 def prepare_yt_dlp_opts(cookiefile=None, output_template=None, progress_hook=None,
                         format_override=None, audio_convert=None):
     headers = {
@@ -71,7 +87,6 @@ def prepare_yt_dlp_opts(cookiefile=None, output_template=None, progress_hook=Non
         ),
         "Accept-Language": "en-US,en;q=0.9",
     }
-
     opts = {
         "format": format_override or "bestvideo+bestaudio/best",
         "quiet": True,
@@ -82,19 +97,14 @@ def prepare_yt_dlp_opts(cookiefile=None, output_template=None, progress_hook=Non
         "socket_timeout": 30,
         "nocheckcertificate": True,
         "geo_bypass": True,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "web"],  # Android fallback avoids bot-check
-                "skip": ["hls_dash"]
-            }
-        }
+        "extractor_args": {"youtube": {"player_client": ["android", "web"], "skip": ["hls_dash"]}},
     }
 
     proxy = os.environ.get("YTDLP_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY")
     if proxy:
         opts["proxy"] = proxy
 
-    # Choose correct cookie file
+    # cookies precedence: uploaded -> /tmp -> local file next to app.py
     if cookiefile:
         opts["cookiefile"] = cookiefile
     else:
@@ -103,7 +113,7 @@ def prepare_yt_dlp_opts(cookiefile=None, output_template=None, progress_hook=Non
             opts["cookiefile"] = str(tmp_cookie)
         else:
             local_cookie = BASE_DIR / "cookies.txt"
-            if local_cookie.exists():
+            if local_cookie.exists() and local_cookie.stat().st_size > 10:
                 opts["cookiefile"] = str(local_cookie)
 
     if audio_convert:
@@ -122,41 +132,46 @@ def ydl_extract_info(url, opts, download=False):
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=download)
-            filename = ydl.prepare_filename(info) if download else None
-            return {"ok": True, "info": info, "filename": filename}
+            fn = ydl.prepare_filename(info) if download else None
+            return {"ok": True, "info": info, "filename": fn}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ---------------- Utility ----------------
-def _cookie_path_candidates():
-    return [Path("/tmp/cookies.txt"), BASE_DIR / "cookies.txt", Path("/mnt/data/cookies.txt")]
 
+# ---------------- Diagnostics routes ----------------
 @app.route("/cookie_status", methods=["GET"])
 def cookie_status():
-    out = []
-    for p in _cookie_path_candidates():
+    rows = []
+    for p in cookie_candidates():
         try:
             if p.exists():
-                out.append({"path": str(p), "exists": True, "size": p.stat().st_size})
+                rows.append({"path": str(p), "exists": True, "size": p.stat().st_size})
             else:
-                out.append({"path": str(p), "exists": False, "size": 0})
+                rows.append({"path": str(p), "exists": False, "size": 0})
         except Exception as e:
-            out.append({"path": str(p), "error": str(e)})
-    return jsonify({"ok": True, "candidates": out})
+            rows.append({"path": str(p), "error": str(e)})
+    return jsonify({"ok": True, "candidates": rows})
+
 
 @app.route("/default_cookies", methods=["GET"])
-def default_cookies_route_strict():
-    for p in _cookie_path_candidates():
-        if p.exists() and p.is_file():
-            sz = p.stat().st_size
-            if sz >= 10:
-                return send_file(str(p), mimetype="text/plain")
+def default_cookies_route():
+    for p in cookie_candidates():
+        if p.exists() and p.is_file() and p.stat().st_size >= 10:
+            return send_file(str(p), mimetype="text/plain")
     return ("", 404)
 
-# ---------------- Routes ----------------
-@app.route("/")
+
+# ---------------- App routes ----------------
+@app.route("/", methods=["GET"])
 def index():
-    return render_template("index.html")
+    try:
+        return render_template("index.html")
+    except Exception:
+        # Fallback to static index
+        static_index = BASE_DIR / "static" / "index.html"
+        if static_index.exists():
+            return send_from_directory(str(static_index.parent), static_index.name)
+        return ("<h3>Index not found</h3>", 200)
 
 @app.route("/info", methods=["POST"])
 def info():
@@ -178,10 +193,10 @@ def info():
         if cookiefile:
             try:
                 os.unlink(cookiefile)
-            except:
+            except Exception:
                 pass
 
-    if result["ok"]:
+    if result.get("ok"):
         info = result["info"]
         return jsonify({
             "ok": True,
@@ -189,3 +204,105 @@ def info():
             "title": info.get("title"),
             "thumbnail": info.get("thumbnail"),
             "uploader": info.get("uploader"),
+            "duration": info.get("duration"),
+            "formats": info.get("formats", []),
+        }), 200
+    else:
+        err = result.get("error", "")
+        hint = None
+        if ("Sign in to confirm" in err) or ("bot" in err) or ("403" in err):
+            hint = "YouTube bot-check; update cookies (YTDLP_COOKIES_B64) or verify the account. Proxy may help."
+        return jsonify({"ok": False, "error": err, "hint": hint}), 422
+
+
+@app.route("/download", methods=["POST"])
+def download():
+    url = request.form.get("url")
+    requested = request.form.get("requested", "").strip()
+    if not url:
+        return jsonify({"ok": False, "error": "URL missing"}), 400
+
+    cookiefile = None
+    if "cookies" in request.files:
+        f = request.files["cookies"]
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+        f.save(tmp.name)
+        cookiefile = tmp.name
+
+    task_id = str(uuid.uuid4())
+    with TASK_LOCK:
+        TASKS[task_id] = {"status": "running", "progress": "0%", "messages": []}
+
+    def progress_hook(d):
+        if d.get("status") == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            done = d.get("downloaded_bytes", 0)
+            pct = int(done * 100 / total) if total else 0
+            TASKS[task_id]["progress"] = f"{pct}%"
+        elif d.get("status") == "finished":
+            TASKS[task_id]["progress"] = "100%"
+            TASKS[task_id]["status"] = "processing"
+
+    def worker():
+        try:
+            fmt = None
+            audio_convert = None
+            if requested.startswith("audio:"):
+                audio_convert = {"codec": requested.split(":", 1)[1], "quality": 192}
+                fmt = "bestaudio/best"
+            elif requested:
+                fmt = requested
+
+            opts = prepare_yt_dlp_opts(cookiefile=cookiefile, progress_hook=progress_hook,
+                                       format_override=fmt, audio_convert=audio_convert)
+            res = ydl_extract_info(url, opts, download=True)
+            if res.get("ok"):
+                fn = Path(res["filename"]).name if res.get("filename") else None
+                TASKS[task_id].update({"status": "done", "filename": fn})
+            else:
+                TASKS[task_id].update({"status": "error", "error": res.get("error")})
+        except Exception as e:
+            TASKS[task_id].update({"status": "error", "error": str(e)})
+        finally:
+            if cookiefile:
+                try:
+                    os.unlink(cookiefile)
+                except Exception:
+                    pass
+
+    threading.Thread(target=worker, daemon=True).start()
+    return jsonify({"ok": True, "task_id": task_id}), 200
+
+
+@app.route("/task/<tid>", methods=["GET"])
+def task_status(tid):
+    t = TASKS.get(tid)
+    if not t:
+        return jsonify({"ok": False, "error": "Task not found"}), 404
+    return jsonify({"ok": True, "task": t}), 200
+
+
+@app.route("/download_file/<filename>", methods=["GET"])
+def serve_file(filename):
+    p = DOWNLOAD_DIR / Path(filename).name
+    if p.exists():
+        return send_file(str(p), as_attachment=True)
+    return jsonify({"ok": False, "error": "File not found"}), 404
+
+
+# ---------------- Error handlers ----------------
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"ok": False, "error": "not_found"}), 404
+
+@app.errorhandler(500)
+def server_error(e):
+    tb = traceback.format_exc()
+    app.logger.error(tb)
+    return jsonify({"ok": False, "error": "internal_server_error", "trace": tb}), 500
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    print(f"Server started at http://127.0.0.1:{port}")
+    app.run(host="0.0.0.0", port=port)
