@@ -11,7 +11,6 @@ from flask import Flask, request, jsonify, send_file, render_template, send_from
 import yt_dlp
 import base64
 
-# ---------- App setup ----------
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.config["JSON_SORT_KEYS"] = False
 
@@ -22,39 +21,20 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 TASKS = {}
 TASK_LOCK = threading.Lock()
 
-# ---------- Utilities ----------
-def add_task_message(task_id, text):
-    t = TASKS.get(task_id)
-    if not t:
-        return
-    msgs = t.setdefault("messages", [])
-    msgs.append({"ts": int(time.time()), "text": text})
 
-def run_cmd(cmd_list, timeout=None):
-    try:
-        proc = subprocess.run(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=timeout)
-        return proc.returncode, proc.stdout.decode(errors="ignore"), proc.stderr.decode(errors="ignore")
-    except Exception as e:
-        return 1, "", str(e)
-
-# ---------- Cookies auto-manage ----------
-def write_text_file(path: Path, data: str | bytes) -> None:
+# ---------------- Utility ----------------
+def write_text_file(path: Path, data: str | bytes):
     path.parent.mkdir(parents=True, exist_ok=True)
     mode = "wb" if isinstance(data, (bytes, bytearray)) else "w"
     with open(path, mode, encoding=None if mode == "wb" else "utf-8") as f:
         f.write(data)
 
+
+# ---------------- Auto Cookie Setup ----------------
 def ensure_cookies_from_env_once() -> str | None:
-    """
-    Re-create cookies.txt next to app.py from ENV if provided.
-    Supports:
-      - YTDLP_COOKIES_B64  (base64 of full Netscape cookies.txt)
-      - YTDLP_COOKIES      (raw Netscape cookies content)
-      - COOKIES_URL        (fallback; downloaded by background thread)
-    Returns path string if created, else None.
-    """
+    """Restore cookies.txt from ENV if present"""
     try:
-        target = BASE_DIR / "cookies.txt"
+        target = Path("/tmp/cookies.txt")
 
         b64 = os.environ.get("YTDLP_COOKIES_B64")
         raw = os.environ.get("YTDLP_COOKIES")
@@ -62,98 +42,83 @@ def ensure_cookies_from_env_once() -> str | None:
         if b64:
             data = base64.b64decode(b64)
             write_text_file(target, data)
-            app.logger.info("✅ cookies.txt restored from YTDLP_COOKIES_B64")
+            app.logger.info("✅ Cookies.txt restored from YTDLP_COOKIES_B64 → /tmp/cookies.txt")
             return str(target)
-
-        if raw:
+        elif raw:
             write_text_file(target, raw)
-            app.logger.info("✅ cookies.txt restored from YTDLP_COOKIES")
+            app.logger.info("✅ Cookies.txt restored from YTDLP_COOKIES → /tmp/cookies.txt")
             return str(target)
-
-        # If neither present, do nothing here. COOKIES_URL will be handled by refresher thread.
-        return None
+        else:
+            url = os.environ.get("COOKIES_URL")
+            if url:
+                import urllib.request
+                try:
+                    with urllib.request.urlopen(url, timeout=10) as r:
+                        data = r.read()
+                        if data and len(data) > 10:
+                            write_text_file(target, data)
+                            app.logger.info("✅ Cookies.txt downloaded from COOKIES_URL → /tmp/cookies.txt")
+                            return str(target)
+                except Exception as e:
+                    app.logger.warning(f"Failed to download cookies.txt: {e}")
+            return None
     except Exception as e:
-        app.logger.error(f"Failed to restore cookies from ENV: {e}")
+        app.logger.error(f"Cookie setup failed: {e}")
         return None
 
-def _download_text(url: str, timeout: int = 12) -> str | None:
-    try:
-        # Use Python's urllib to avoid external deps
-        import urllib.request
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            ct = resp.headers.get("content-type", "")
-            text = resp.read().decode("utf-8", errors="ignore")
-            if not text.strip():
-                return None
-            return text
-    except Exception as e:
-        app.logger.warning(f"cookies fetch failed from URL: {e}")
-        return None
 
-def start_cookies_refresher():
-    """
-    If COOKIES_URL is set, refresh cookies.txt from that URL at startup and then every 6 hours.
-    """
-    url = os.environ.get("COOKIES_URL")
-    if not url:
-        return
-
-    def worker():
-        while True:
-            try:
-                txt = _download_text(url)
-                if txt and len(txt.strip()) > 10:  # very small files are likely invalid
-                    write_text_file(BASE_DIR / "cookies.txt", txt)
-                    app.logger.info("✅ cookies.txt refreshed from COOKIES_URL")
-            except Exception as e:
-                app.logger.warning(f"cookies refresher error: {e}")
-            # Sleep 6 hours
-            time.sleep(6 * 60 * 60)
-
-    th = threading.Thread(target=worker, daemon=True)
-    th.start()
-
-# Restore from ENV immediately at import time (works with gunicorn)
+# Run cookie restore at startup
 ensure_cookies_from_env_once()
-# Then start URL refresher thread if configured
-start_cookies_refresher()
 
-# ---------- yt-dlp helpers ----------
+
+# ---------------- yt-dlp Options ----------------
 def prepare_yt_dlp_opts(cookiefile=None, output_template=None, progress_hook=None,
                         format_override=None, audio_convert=None):
     headers = {
-        # modern UA helps reduce 403
         "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "Mozilla/5.0 (Linux; Android 12; SM-G991B Build/SP1A.210812.016) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/128.0.6613.84 Safari/537.36"
+            "Chrome/128.0.6613.84 Mobile Safari/537.36"
         ),
         "Accept-Language": "en-US,en;q=0.9",
     }
+
     opts = {
         "format": format_override or "bestvideo+bestaudio/best",
         "quiet": True,
         "no_warnings": True,
         "outtmpl": output_template or str(DOWNLOAD_DIR / "%(title)s - %(id)s.%(ext)s"),
         "http_headers": headers,
-        # a few network resiliency knobs
         "retries": 5,
         "socket_timeout": 30,
         "nocheckcertificate": True,
         "geo_bypass": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"],  # Android fallback avoids bot-check
+                "skip": ["hls_dash"]
+            }
+        }
     }
+
+    # Proxy support
     proxy = os.environ.get("YTDLP_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY")
     if proxy:
         opts["proxy"] = proxy
 
+    # Use uploaded or default cookies
     if cookiefile:
         opts["cookiefile"] = cookiefile
     else:
-        # If no uploaded cookies, use server default if present
-        server_cookie = BASE_DIR / "cookies.txt"
-        if server_cookie.exists():
-            opts["cookiefile"] = str(server_cookie)
+        tmp_cookie = Path("/tmp/cookies.txt")
+        if tmp_cookie.exists():
+            opts["cookiefile"] = str(tmp_cookie)
+        else:
+            local_cookie = BASE_DIR / "cookies.txt"
+            if local_cookie.exists():
+                opts["cookiefile"] = str(local_cookie)
 
+    # Audio extract option
     if audio_convert:
         opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
@@ -166,55 +131,40 @@ def prepare_yt_dlp_opts(cookiefile=None, output_template=None, progress_hook=Non
 
     return opts
 
+
 def ydl_extract_info(url, opts, download=False):
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=download)
-            return {"ok": True, "info": info, "filename": (ydl.prepare_filename(info) if download else None)}
+            filename = ydl.prepare_filename(info) if download else None
+            return {"ok": True, "info": info, "filename": filename}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ---------- Routes ----------
-@app.route("/", methods=["GET"])
+
+# ---------------- Flask Routes ----------------
+@app.route("/")
 def index():
-    try:
-        return render_template("index.html")
-    except Exception:
-        # Fallback to static if templates missing
-        static_index = app.static_folder and (Path(app.static_folder) / "index.html")
-        if static_index and static_index.exists():
-            return send_from_directory(app.static_folder, "index.html")
-        return ("<h3>Index not found</h3>", 200)
+    return render_template("index.html")
 
-@app.route("/favicon.ico")
-def favicon():
-    static_dir = Path(app.static_folder or "static")
-    fav = static_dir / "favicon.ico"
-    if fav.exists():
-        return send_from_directory(str(static_dir), "favicon.ico")
-    return ("", 204)
 
-@app.route("/default_cookies", methods=["GET"])
-def default_cookies_route():
-    """
-    Serve cookies.txt from same folder as app.py (used by front-end to auto-attach).
-    """
-    path = BASE_DIR / "cookies.txt"
-    if path.exists() and path.is_file():
+@app.route("/default_cookies")
+def default_cookies():
+    path = Path("/tmp/cookies.txt")
+    if path.exists():
         return send_file(str(path), mimetype="text/plain")
-    # Also allow /tmp or /mnt/data as fallback if you ever store there
-    for p in (Path("/tmp/cookies.txt"), Path("/mnt/data/cookies.txt")):
-        if p.exists() and p.is_file():
-            return send_file(str(p), mimetype="text/plain")
+    local = BASE_DIR / "cookies.txt"
+    if local.exists():
+        return send_file(str(local), mimetype="text/plain")
     return ("", 404)
 
+
 @app.route("/info", methods=["POST"])
-def info_route():
+def info():
     url = request.form.get("url")
     if not url:
-        return jsonify({"ok": False, "error": "url missing"}), 400
+        return jsonify({"ok": False, "error": "URL missing"}), 400
 
-    # uploaded cookies take precedence
     cookiefile = None
     if "cookies" in request.files:
         f = request.files["cookies"]
@@ -229,10 +179,10 @@ def info_route():
         if cookiefile:
             try:
                 os.unlink(cookiefile)
-            except Exception:
+            except:
                 pass
 
-    if result.get("ok"):
+    if result["ok"]:
         info = result["info"]
         return jsonify({
             "ok": True,
@@ -241,24 +191,23 @@ def info_route():
             "thumbnail": info.get("thumbnail"),
             "uploader": info.get("uploader"),
             "duration": info.get("duration"),
-            "formats": info.get("formats", []),
-        }), 200
+            "formats": info.get("formats", [])
+        })
     else:
-        # Common 403 hint
         err = result.get("error", "")
         hint = None
-        if "403" in err or "Forbidden" in err:
-            hint = "403 from upstream — ensure valid cookies or set YTDLP_COOKIES_B64 / COOKIES_URL."
+        if "Sign in to confirm" in err or "bot" in err or "403" in err:
+            hint = "YouTube bot-check: please update cookies or verify account."
         return jsonify({"ok": False, "error": err, "hint": hint}), 422
 
+
 @app.route("/download", methods=["POST"])
-def download_route():
+def download():
     url = request.form.get("url")
     requested = request.form.get("requested", "").strip()
     if not url:
-        return jsonify({"ok": False, "error": "url missing"}), 400
+        return jsonify({"ok": False, "error": "URL missing"}), 400
 
-    # uploaded cookies take precedence
     cookiefile = None
     if "cookies" in request.files:
         f = request.files["cookies"]
@@ -267,87 +216,78 @@ def download_route():
         cookiefile = tmp.name
 
     task_id = str(uuid.uuid4())
-    with TASK_LOCK:
-        TASKS[task_id] = {
-            "status": "running", "progress": "0%",
-            "messages": [], "created": time.time()
-        }
-    add_task_message(task_id, "Task started")
+    TASKS[task_id] = {"status": "running", "progress": "0%", "messages": []}
 
     def progress_hook(d):
-        try:
-            if d.get("status") == "downloading":
-                total = d.get("total_bytes") or d.get("total_bytes_estimate")
-                done = d.get("downloaded_bytes", 0)
-                pct = int(done * 100 / total) if total else 0
-                TASKS[task_id]["progress"] = f"{pct}%"
-            elif d.get("status") == "finished":
-                TASKS[task_id]["progress"] = "100%"
-                TASKS[task_id]["status"] = "processing"
-        except Exception:
-            pass
+        if d.get("status") == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            done = d.get("downloaded_bytes", 0)
+            pct = int(done * 100 / total) if total else 0
+            TASKS[task_id]["progress"] = f"{pct}%"
+        elif d.get("status") == "finished":
+            TASKS[task_id]["progress"] = "100%"
+            TASKS[task_id]["status"] = "processing"
 
     def worker():
         try:
             fmt = None
             audio_convert = None
-            if requested:
-                if requested.startswith("audio:"):
-                    audio_convert = {"codec": requested.split(":", 1)[1], "quality": 192}
-                    fmt = "bestaudio/best"
-                else:
-                    fmt = requested
+            if requested.startswith("audio:"):
+                audio_convert = {"codec": requested.split(":", 1)[1], "quality": 192}
+                fmt = "bestaudio/best"
+            elif requested:
+                fmt = requested
 
             opts = prepare_yt_dlp_opts(cookiefile=cookiefile, progress_hook=progress_hook,
                                        format_override=fmt, audio_convert=audio_convert)
 
-            res = ydl_extract_info(url, opts, download=True)
-            if res.get("ok"):
-                filename = Path(res["filename"]).name if res.get("filename") else None
+            result = ydl_extract_info(url, opts, download=True)
+            if result["ok"]:
+                filename = Path(result["filename"]).name
                 TASKS[task_id].update({"status": "done", "filename": filename})
-                add_task_message(task_id, f"Done: {filename or '(unknown)'}")
             else:
-                TASKS[task_id].update({"status": "error", "error": res.get("error")})
-                add_task_message(task_id, f"Error: {res.get('error')}")
+                TASKS[task_id].update({"status": "error", "error": result["error"]})
         except Exception as e:
             TASKS[task_id].update({"status": "error", "error": str(e)})
         finally:
             if cookiefile:
                 try:
                     os.unlink(cookiefile)
-                except Exception:
+                except:
                     pass
 
     threading.Thread(target=worker, daemon=True).start()
-    return jsonify({"ok": True, "task_id": task_id}), 200
+    return jsonify({"ok": True, "task_id": task_id})
 
-@app.route("/task/<tid>", methods=["GET"])
+
+@app.route("/task/<tid>")
 def task_status(tid):
     t = TASKS.get(tid)
     if not t:
-        return jsonify({"ok": False, "error": "no such task"}), 404
-    return jsonify({"ok": True, "task": t}), 200
+        return jsonify({"ok": False, "error": "Task not found"}), 404
+    return jsonify({"ok": True, "task": t})
 
-@app.route("/download_file/<filename>", methods=["GET"])
+
+@app.route("/download_file/<filename>")
 def serve_file(filename):
-    safe = Path(filename).name
-    p = DOWNLOAD_DIR / safe
-    if p.exists():
-        return send_file(str(p), as_attachment=True)
-    return jsonify({"ok": False, "error": "file not found"}), 404
+    f = DOWNLOAD_DIR / Path(filename).name
+    if f.exists():
+        return send_file(str(f), as_attachment=True)
+    return jsonify({"ok": False, "error": "File not found"}), 404
 
-# ---------- Global JSON error handlers ----------
+
+# ---------------- Error Handlers ----------------
 @app.errorhandler(404)
-def not_found(e):
-    return jsonify({"ok": False, "error": "not_found", "detail": str(e)}), 404
+def nf(e):
+    return jsonify({"ok": False, "error": "not_found"}), 404
 
 @app.errorhandler(500)
-def internal_err(e):
+def err(e):
     tb = traceback.format_exc()
-    app.logger.error("500: %s", tb)
-    return jsonify({"ok": False, "error": "internal_server_error", "trace": tb}), 500
+    app.logger.error(f"Server Error: {tb}")
+    return jsonify({"ok": False, "error": "internal_error", "trace": tb}), 500
 
-# ---------- Local run ----------
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Server started at http://127.0.0.1:{port}")
